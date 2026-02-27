@@ -1,0 +1,8 @@
+anthropic
+nfl_data_py
+pandas
+numpy
+streamlit
+pyarrow
+appdirs
+certifi
