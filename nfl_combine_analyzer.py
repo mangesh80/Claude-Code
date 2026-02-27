@@ -13,7 +13,6 @@ Usage:
 import ssl
 import sys
 import argparse
-import anthropic
 import numpy as np
 import pandas as pd
 
@@ -265,6 +264,7 @@ def analyze_with_claude(
     similar_players: pd.DataFrame,
     metrics: list[str],
 ) -> None:
+    import anthropic  # only needed for the CLI; not used by the Streamlit app
     client = anthropic.Anthropic()
 
     target_card = format_player_card(target, metrics)
