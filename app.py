@@ -345,11 +345,13 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
 
+    # Read key from Streamlit secrets (Cloud) or env var (local)
+    _default_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     api_key_input = st.text_input(
         "Google API Key",
         type="password",
         placeholder="AIza...",
-        value=os.getenv("GOOGLE_API_KEY", ""),
+        value=_default_key,
         help="Get your key at aistudio.google.com",
     )
 

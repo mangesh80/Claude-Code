@@ -1,8 +1,8 @@
-anthropic
-nfl_data_py
+streamlit
+google-genai
 pandas
 numpy
-streamlit
 pyarrow
+nfl_data_py
 appdirs
 certifi
