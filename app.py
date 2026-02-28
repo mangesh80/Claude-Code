@@ -136,24 +136,88 @@ _STAT_RENAME = {
 
 
 @st.cache_data(show_spinner=False)
-def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
-    """Load NFL regular-season player stats, enriched with player display names.
+def _build_2025_from_ngs() -> pd.DataFrame | None:
+    """Aggregate 2025 season stats from NGS weekly data.
 
-    import_seasonal_data() only contains player_id; we join with import_players()
-    to add a player_display_name column for name-based lookups.
-    Returns (DataFrame, None) on success, or (None, error_message) on failure.
+    import_seasonal_data([2025]) returns 404 until nflverse publishes the parquet.
+    NGS data (passing / rushing / receiving) is available immediately after each
+    week and already has player_display_name — no name join needed.
     """
     import nfl_data_py as nfl
 
-    # ── 1. Load seasonal stats ────────────────────────────────────────────────
-    # Strategy: load a stable base range (ending at NFL_CURRENT_SEASON-1), then
-    # try to append the current season individually.  This handles the case where
-    # the current-season parquet isn't published yet (404) without losing the
-    # prior season's data.
+    ID, NM, TM = "player_gsis_id", "player_display_name", "team_abbr"
+    KEY = ["season", "player_id", "player_display_name", "recent_team"]
+
+    def _agg(stat_type: str, agg_map: dict) -> pd.DataFrame | None:
+        try:
+            raw = nfl.import_ngs_data(stat_type, [NFL_CURRENT_SEASON])
+            raw = raw[(raw["season_type"] == "REG") & (raw["week"] >= 1)]
+            if raw.empty:
+                return None
+            # Use last team for the season
+            team_map = raw.sort_values("week").groupby([ID, NM])[TM].last()
+            g = (raw.groupby(["season", ID, NM])
+                    .agg(**agg_map)
+                    .reset_index()
+                    .rename(columns={ID: "player_id", NM: "player_display_name"}))
+            g["recent_team"] = g.set_index(["player_id", "player_display_name"]).index.map(
+                lambda x: team_map.get(x, pd.NA)
+            )
+            return g
+        except Exception:
+            return None
+
+    pass_df = _agg("passing", {
+        "games":          pd.NamedAgg("week", "count"),
+        "completions":    pd.NamedAgg("completions", "sum"),
+        "attempts":       pd.NamedAgg("attempts", "sum"),
+        "passing_yards":  pd.NamedAgg("pass_yards", "sum"),
+        "passing_tds":    pd.NamedAgg("pass_touchdowns", "sum"),
+        "interceptions":  pd.NamedAgg("interceptions", "sum"),
+    })
+    rush_df = _agg("rushing", {
+        "games_r":        pd.NamedAgg("week", "count"),
+        "carries":        pd.NamedAgg("rush_attempts", "sum"),
+        "rushing_yards":  pd.NamedAgg("rush_yards", "sum"),
+        "rushing_tds":    pd.NamedAgg("rush_touchdowns", "sum"),
+    })
+    recv_df = _agg("receiving", {
+        "games_v":        pd.NamedAgg("week", "count"),
+        "receptions":     pd.NamedAgg("receptions", "sum"),
+        "targets":        pd.NamedAgg("targets", "sum"),
+        "receiving_yards": pd.NamedAgg("yards", "sum"),
+        "receiving_tds":  pd.NamedAgg("rec_touchdowns", "sum"),
+    })
+
+    frames = [f for f in (pass_df, rush_df, recv_df) if f is not None]
+    if not frames:
+        return None
+
+    combined = frames[0]
+    for other in frames[1:]:
+        combined = combined.merge(other, on=KEY, how="outer")
+    # Unify the per-stat-type games columns into one
+    game_cols = [c for c in combined.columns if c == "games" or c.startswith("games_")]
+    if game_cols:
+        combined["games"] = combined[game_cols].max(axis=1)
+        combined = combined.drop(columns=[c for c in game_cols if c != "games"])
+
+    return combined
+
+
+@st.cache_data(show_spinner=False)
+def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
+    """Load NFL regular-season player stats with player display names.
+
+    Historical data (1999–NFL_CURRENT_SEASON-1) comes from import_seasonal_data().
+    Current season uses NGS weekly data as a fallback when the parquet isn't
+    published yet.  Names are joined from import_players() for historical rows.
+    """
+    import nfl_data_py as nfl
+
+    # ── 1. Load historical stats ──────────────────────────────────────────────
     last_err = ""
     df = None
-
-    # Find the highest base year that loads cleanly (usually NFL_CURRENT_SEASON-1)
     for base_max in [NFL_CURRENT_SEASON - 1, NFL_CURRENT_SEASON - 2]:
         try:
             df = nfl.import_seasonal_data(list(range(1999, base_max + 1)))
@@ -165,35 +229,28 @@ def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
     if df is None or df.empty:
         return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
 
-    # Try to append the current season on top (may 404 if not yet published)
-    try:
-        df_cur = nfl.import_seasonal_data([NFL_CURRENT_SEASON])
-        if df_cur is not None and not df_cur.empty:
-            df = pd.concat([df, df_cur], ignore_index=True)
-    except Exception:
-        pass  # current season not available yet — continue with base data
-
-    # ── 2. Enrich with player names if not already present ───────────────────
+    # ── 2. Enrich historical rows with player names ───────────────────────────
     has_name = any(c in df.columns for c in
                    ("player_display_name", "player_name", "display_name", "name"))
     if not has_name and "player_id" in df.columns:
         try:
             players = nfl.import_players()
-            # nfl_data_py import_players() uses 'gsis_id' as the key and
-            # 'display_name' as the human-readable name.
             id_col = next(
-                (c for c in ("gsis_id", "player_id") if c in players.columns), None
-            )
+                (c for c in ("gsis_id", "player_id") if c in players.columns), None)
             nm_col = next(
                 (c for c in ("display_name", "player_name", "short_name")
-                 if c in players.columns), None
-            )
+                 if c in players.columns), None)
             if id_col and nm_col:
                 name_map = (players.dropna(subset=[id_col, nm_col])
                             .set_index(id_col)[nm_col].to_dict())
                 df["player_display_name"] = df["player_id"].map(name_map)
         except Exception as e:
             last_err = f"stats loaded but name join failed: {e}"
+
+    # ── 3. Append current season from NGS ────────────────────────────────────
+    df_cur = _build_2025_from_ngs()
+    if df_cur is not None and not df_cur.empty:
+        df = pd.concat([df, df_cur], ignore_index=True)
 
     return df, None
 
