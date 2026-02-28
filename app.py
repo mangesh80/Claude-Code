@@ -146,16 +146,20 @@ def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
     import nfl_data_py as nfl
 
     last_err = ""
-    for year_range in [
-        list(range(NFL_CURRENT_SEASON - 4, NFL_CURRENT_SEASON + 1)),  # recent 5 seasons (fast)
-        list(range(1999, NFL_CURRENT_SEASON + 1)),                     # full history
-    ]:
-        try:
-            df = nfl.import_seasonal_data(year_range)
-            if df is not None and not df.empty:
-                return df, None
-        except Exception as e:
-            last_err = str(e)
+    # Walk back the upper-bound year in case recent seasons aren't published yet
+    # (e.g. 2025 parquet may not be on nflverse right after the Super Bowl)
+    for max_year in [NFL_CURRENT_SEASON, NFL_CURRENT_SEASON - 1, NFL_CURRENT_SEASON - 2]:
+        for year_range in [
+            list(range(max(max_year - 4, 1999), max_year + 1)),  # recent 5 seasons (fast)
+            list(range(1999, max_year + 1)),                       # full history
+        ]:
+            try:
+                df = nfl.import_seasonal_data(year_range)
+                if df is not None and not df.empty:
+                    return df, None
+            except Exception as e:
+                last_err = str(e)
+                break  # 404 on this max_year → try with older max_year
 
     return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
 
