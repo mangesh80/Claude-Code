@@ -137,31 +137,58 @@ _STAT_RENAME = {
 
 @st.cache_data(show_spinner=False)
 def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
-    """Load NFL regular-season player stats.
+    """Load NFL regular-season player stats, enriched with player display names.
 
+    import_seasonal_data() only contains player_id; we join with import_players()
+    to add a player_display_name column for name-based lookups.
     Returns (DataFrame, None) on success, or (None, error_message) on failure.
-    Tries recent seasons first (faster), then full history.
-    Never requests years beyond NFL_CURRENT_SEASON to avoid missing-file errors.
     """
     import nfl_data_py as nfl
 
+    # ── 1. Load seasonal stats ────────────────────────────────────────────────
     last_err = ""
-    # Walk back the upper-bound year in case recent seasons aren't published yet
-    # (e.g. 2025 parquet may not be on nflverse right after the Super Bowl)
+    df = None
     for max_year in [NFL_CURRENT_SEASON, NFL_CURRENT_SEASON - 1, NFL_CURRENT_SEASON - 2]:
         for year_range in [
-            list(range(max(max_year - 4, 1999), max_year + 1)),  # recent 5 seasons (fast)
-            list(range(1999, max_year + 1)),                       # full history
+            list(range(max(max_year - 4, 1999), max_year + 1)),
+            list(range(1999, max_year + 1)),
         ]:
             try:
                 df = nfl.import_seasonal_data(year_range)
                 if df is not None and not df.empty:
-                    return df, None
+                    break
             except Exception as e:
                 last_err = str(e)
-                break  # 404 on this max_year → try with older max_year
+                break
+        if df is not None and not df.empty:
+            break
 
-    return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
+    if df is None or df.empty:
+        return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
+
+    # ── 2. Enrich with player names if not already present ───────────────────
+    has_name = any(c in df.columns for c in
+                   ("player_display_name", "player_name", "display_name", "name"))
+    if not has_name and "player_id" in df.columns:
+        try:
+            players = nfl.import_players()
+            # nfl_data_py import_players() uses 'gsis_id' as the key and
+            # 'display_name' as the human-readable name.
+            id_col = next(
+                (c for c in ("gsis_id", "player_id") if c in players.columns), None
+            )
+            nm_col = next(
+                (c for c in ("display_name", "player_name", "short_name")
+                 if c in players.columns), None
+            )
+            if id_col and nm_col:
+                name_map = (players.dropna(subset=[id_col, nm_col])
+                            .set_index(id_col)[nm_col].to_dict())
+                df["player_display_name"] = df["player_id"].map(name_map)
+        except Exception as e:
+            last_err = f"stats loaded but name join failed: {e}"
+
+    return df, None
 
 
 def get_player_career_stats(player_name: str) -> tuple[pd.DataFrame | None, str | None]:
