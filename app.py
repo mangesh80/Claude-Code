@@ -108,6 +108,113 @@ def get_school_list() -> list[str]:
     return [""] + schools  # blank first so user must pick
 
 
+# ── NFL career stat columns to fetch per position ─────────────────────────────
+_CAREER_STAT_COLS: dict[str, list[str]] = {
+    "QB": ["games", "completions", "attempts", "passing_yards", "passing_tds",
+           "interceptions", "rushing_yards", "rushing_tds"],
+    "RB": ["games", "carries", "rushing_yards", "rushing_tds",
+           "receptions", "receiving_yards", "receiving_tds"],
+    "FB": ["games", "carries", "rushing_yards", "receptions", "receiving_yards"],
+    "WR": ["games", "receptions", "targets", "receiving_yards", "receiving_tds"],
+    "TE": ["games", "receptions", "targets", "receiving_yards", "receiving_tds"],
+}
+
+_STAT_RENAME = {
+    "season": "Season", "recent_team": "Team", "team": "Team",
+    "games": "GP", "completions": "Cmp", "attempts": "Att",
+    "passing_yards": "Pass Yds", "passing_tds": "Pass TDs",
+    "interceptions": "INTs", "rushing_yards": "Rush Yds",
+    "rushing_tds": "Rush TDs", "carries": "Carries",
+    "receptions": "Rec", "targets": "Tgt",
+    "receiving_yards": "Rec Yds", "receiving_tds": "Rec TDs",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_nfl_seasonal_data() -> pd.DataFrame | None:
+    """Load all available NFL regular-season stats (cached after first call)."""
+    try:
+        import nfl_data_py as nfl
+        years = list(range(1999, CURRENT_YEAR + 1))
+        return nfl.import_seasonal_data(years, s_type="REG")
+    except Exception:
+        return None
+
+
+def get_player_career_stats(player_name: str) -> pd.DataFrame | None:
+    """Return career NFL stats for a player, or None if they have no NFL record."""
+    seasonal = load_nfl_seasonal_data()
+    if seasonal is None or seasonal.empty:
+        return None
+
+    name_col = next(
+        (c for c in ("player_display_name", "player_name") if c in seasonal.columns), None
+    )
+    if name_col is None:
+        return None
+
+    name_lower = player_name.lower().strip()
+
+    # 1. Exact match
+    mask = seasonal[name_col].str.lower().str.strip() == name_lower
+    found = seasonal[mask]
+
+    # 2. Last-name + first-initial fallback
+    if found.empty:
+        parts = name_lower.split()
+        if len(parts) >= 2:
+            last, first_init = parts[-1], parts[0][0]
+            mask2 = (
+                seasonal[name_col].str.lower().str.contains(last, na=False, regex=False)
+                & seasonal[name_col].str.lower().str.startswith(first_init, na=False)
+            )
+            found = seasonal[mask2]
+
+    if found.empty:
+        return None
+
+    # Only keep seasons where the player actually played
+    if "games" in found.columns:
+        found = found[found["games"].fillna(0) > 0]
+
+    return found.sort_values("season").reset_index(drop=True) if not found.empty else None
+
+
+def format_career_stats_for_prompt(nfl_stats: pd.DataFrame, pos: str) -> str:
+    """Format career stats into readable text for the Gemini prompt."""
+    pos = pos.upper()
+    stat_keys = _CAREER_STAT_COLS.get(pos, ["games"])
+    team_col = next(
+        (c for c in ("recent_team", "team") if c in nfl_stats.columns), None
+    )
+
+    lines = []
+    for _, row in nfl_stats.iterrows():
+        season = int(row["season"]) if pd.notna(row.get("season")) else "?"
+        team   = str(row[team_col]) if team_col and pd.notna(row.get(team_col)) else "?"
+        parts  = [f"{season} ({team})"]
+        for col in stat_keys:
+            v = row.get(col)
+            if pd.notna(v) and float(v) != 0:
+                label = col.replace("_", " ").title()
+                parts.append(f"{label}: {int(v) if float(v) == int(float(v)) else round(float(v), 1)}")
+        lines.append(" | ".join(parts))
+
+    # Career totals line
+    totals = []
+    for col in stat_keys:
+        if col in nfl_stats.columns and col != "games":
+            total = nfl_stats[col].fillna(0).sum()
+            if total > 0:
+                label = col.replace("_", " ").title()
+                totals.append(f"{label}: {int(total) if total == int(total) else round(total, 1)}")
+
+    result = "Season-by-Season:\n" + "\n".join(lines)
+    if totals:
+        result += "\n\nCareer Totals: " + " | ".join(totals)
+    return result
+
+
 def inches_to_ft_in(inches) -> str:
     """Convert total inches to display like 3'4\" or 10'10\"."""
     try:
@@ -128,8 +235,19 @@ def draft_badge(dr, dp) -> str:
     return f'<span class="badge {cls}">{label}</span>'
 
 
-def stream_analysis(target: pd.Series, similar: pd.DataFrame, metrics: list, api_key: str):
-    """Generator that yields text chunks from Gemini."""
+def stream_analysis(
+    target: pd.Series,
+    similar: pd.DataFrame,
+    metrics: list,
+    api_key: str,
+    nfl_stats: pd.DataFrame | None = None,
+):
+    """Generator that yields text chunks from Gemini.
+
+    If *nfl_stats* is provided the prompt pivots to a future-projection
+    analysis grounded in the player's actual NFL career data rather than
+    a pure combine-based prediction.
+    """
     client = genai.Client(api_key=api_key)
     pos = target.get("pos", "?")
 
@@ -137,10 +255,11 @@ def stream_analysis(target: pd.Series, similar: pd.DataFrame, metrics: list, api
     draft_str = f"Round {int(dr)}, Pick #{int(dp)}" if pd.notna(dr) and pd.notna(dp) else "Undrafted / Unknown"
     year = int(target["season"]) if pd.notna(target.get("season")) else "?"
 
+    # ── Build combine profile text ─────────────────────────────────────────────
     target_lines = [
         f"Name: {target.get('player_name', 'Unknown')}",
         f"Position: {pos}",
-        f"Year: {year}",
+        f"Combine Year: {year}",
         f"Draft: {draft_str}",
         "Combine Metrics:",
     ]
@@ -156,12 +275,12 @@ def stream_analysis(target: pd.Series, similar: pd.DataFrame, metrics: list, api
             v = target.get(m)
             val_str = str(v) if pd.notna(v) and v != 0 else "N/A"
         target_lines.append(f"  {label}: {val_str}")
-    # Include 10-yard split if manually entered
     ten = target.get("ten_split")
     if ten is not None and pd.notna(ten) and float(ten) > 0:
         target_lines.append(f"  10-Yard Split: {ten}s")
     target_text = "\n".join(target_lines)
 
+    # ── Build comps text ───────────────────────────────────────────────────────
     comp_cards = []
     for _, row in similar.iterrows():
         s = int(row["season"]) if pd.notna(row.get("season")) else "?"
@@ -180,7 +299,55 @@ def stream_analysis(target: pd.Series, similar: pd.DataFrame, metrics: list, api
         comp_cards.append("\n".join(lines))
     comps_text = "\n\n---\n\n".join(comp_cards)
 
-    prompt = f"""You are a veteran NFL scout and draft analyst with encyclopedic knowledge of NFL combine history, draft results, and player career trajectories from 2000 to the present.
+    # ── Choose prompt branch ───────────────────────────────────────────────────
+    if nfl_stats is not None and not nfl_stats.empty:
+        # Player has real NFL game data → projection prompt
+        career_text = format_career_stats_for_prompt(nfl_stats, str(pos))
+        most_recent = int(nfl_stats["season"].max()) if "season" in nfl_stats.columns else 0
+        status = "active" if most_recent >= CURRENT_YEAR - 2 else "former"
+        seasons_played = len(nfl_stats)
+
+        prompt = f"""You are a veteran NFL analyst with deep knowledge of player development, career arcs, and performance trends.
+
+This player is a {status} NFL {pos} with {seasons_played} regular season(s) of recorded statistics. Use their ACTUAL NFL career data — not just their combine profile — to project their future ceiling and floor.
+
+═══ COMBINE ATHLETIC PROFILE (for context) ═══
+{target_text}
+
+═══ NFL CAREER STATISTICS (primary basis for projection) ═══
+{career_text}
+
+═══ MOST SIMILAR COMBINE PROFILES AT {pos} (athletic baseline reference) ═══
+{comps_text}
+
+═══ ANALYSIS REQUIRED ═══
+
+**1. NFL CAREER PERFORMANCE ASSESSMENT**
+Evaluate what this player has shown in their NFL career so far. Grade their production (Elite / Above-Average / Average / Below-Average / Struggling) relative to the expectations for a {pos} at their draft slot and experience level. Reference specific stat lines.
+
+**2. TRAJECTORY ANALYSIS**
+Examine year-over-year trends. Is this player ascending, plateauing, or declining? What does the trajectory signal about their development curve?
+
+**3. FUTURE CEILING & FLOOR**
+Ground this entirely in their actual NFL performance:
+- **Ceiling**: Best realistic outcome for the remainder of their career. Which historical comp's career arc best matches an optimistic trajectory?
+- **Floor**: Worst realistic outcome. What risks (regression, injury, scheme fit, age) could cap their upside?
+- **Most Likely Outcome**: Given current production, age, and trend.
+
+**4. HOW ATHLETICISM TRANSLATES**
+Has their combine athletic profile translated to the field? Do their physical traits suggest untapped upside, or has production already plateaued relative to their athleticism?
+
+**5. FINAL VERDICT**
+- Current status: Ascending / Established Starter / Declining / Journeyman / Bust
+- Career outlook: Depth Player / Starter / Pro Bowl Caliber / Elite / Future HOF
+- Confidence: Low / Medium / High
+- One concise paragraph summarizing their future projection
+
+Be specific. Cite their actual stat lines. Ground every projection in evidence from their NFL career, not combine potential."""
+
+    else:
+        # Pure prospect — combine-based prediction
+        prompt = f"""You are a veteran NFL scout and draft analyst with encyclopedic knowledge of NFL combine history, draft results, and player career trajectories from 2000 to the present.
 
 Evaluate the TARGET PLAYER's combine profile, compare to historically similar players, and predict career trajectory.
 
@@ -224,21 +391,37 @@ Be specific, analytical, and use the historical comps as evidence."""
 
 
 def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_key: str, is_manual: bool):
-    """Render player card, metrics grid, comps table, and Claude analysis."""
+    """Render player card, metrics grid, comps table, and AI analysis."""
     pos     = str(target.get("pos", "?")).upper()
     metrics = get_metrics_for_position(pos)
     year    = int(target["season"]) if pd.notna(target.get("season")) else "?"
     school  = target.get("school", "")
 
-    # Player header
+    # ── Fetch NFL career stats (search mode only) ──────────────────────────────
+    nfl_stats = None
+    if not is_manual:
+        with st.spinner("Checking for NFL career stats…"):
+            nfl_stats = get_player_career_stats(str(target.get("player_name", "")))
+
+    # ── Player header ──────────────────────────────────────────────────────────
     dr, dp = target.get("draft_round"), target.get("draft_ovr")
     pos_badge  = f'<span class="badge badge-pos">{pos}</span>'
     draft_html = draft_badge(dr, dp)
     manual_tag = '<span class="badge badge-manual">Manual Entry</span>' if is_manual else ""
 
+    nfl_tag = ""
+    if nfl_stats is not None:
+        most_recent = int(nfl_stats["season"].max()) if "season" in nfl_stats.columns else 0
+        is_active   = most_recent >= CURRENT_YEAR - 2
+        nfl_tag = (
+            '<span class="badge badge-r1">Active NFL Player</span>'
+            if is_active
+            else '<span class="badge badge-late">Former NFL Player</span>'
+        )
+
     st.markdown(f"""
     <div class="player-header">
-      <div class="player-name">{target["player_name"]} {pos_badge}{manual_tag}</div>
+      <div class="player-name">{target["player_name"]} {pos_badge}{manual_tag}{nfl_tag}</div>
       <div class="player-meta">{year} NFL Combine{f' · {school}' if school and str(school) not in ('nan', '') else ''}</div>
       {draft_html}
     </div>
@@ -263,7 +446,42 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
                 val_str = str(round(float(v), 2)) if pd.notna(v) and v != 0 else "N/A"
             col.metric(label=label, value=val_str)
 
-    # Comps table
+    # ── NFL Career Stats display (if available) ────────────────────────────────
+    if nfl_stats is not None:
+        st.divider()
+        st.markdown('<div class="section-title">📊 NFL Career Stats</div>', unsafe_allow_html=True)
+
+        stat_keys = _CAREER_STAT_COLS.get(pos, ["games"])
+        team_col  = next((c for c in ("recent_team", "team") if c in nfl_stats.columns), None)
+
+        disp_cols = ["season"]
+        if team_col:
+            disp_cols.append(team_col)
+        disp_cols += [c for c in stat_keys if c in nfl_stats.columns]
+        disp_cols  = [c for c in disp_cols if c in nfl_stats.columns]
+
+        disp = nfl_stats[disp_cols].copy().rename(columns=_STAT_RENAME)
+
+        # Format Season column as integer
+        if "Season" in disp.columns:
+            disp["Season"] = disp["Season"].apply(
+                lambda x: str(int(float(x))) if pd.notna(x) else "—"
+            )
+        # Format numeric columns
+        for col in disp.select_dtypes(include="float").columns:
+            disp[col] = disp[col].apply(
+                lambda x: str(int(x)) if pd.notna(x) and x != 0 else "—"
+            )
+
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        seasons_n = len(nfl_stats)
+        st.caption(
+            f"{seasons_n} season(s) of NFL data found — AI projection below is based on "
+            f"actual career performance, not combine predictions."
+        )
+
+    # ── Comps table ────────────────────────────────────────────────────────────
     st.divider()
     st.markdown(f'<div class="section-title">Top Historical {pos} Comps</div>', unsafe_allow_html=True)
 
@@ -331,7 +549,7 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
     else:
         try:
             with st.spinner("Gemini is thinking..."):
-                st.write_stream(stream_analysis(target, similar, metrics, effective_key))
+                st.write_stream(stream_analysis(target, similar, metrics, effective_key, nfl_stats=nfl_stats))
         except Exception as e:
             if "API_KEY" in str(e).upper() or "401" in str(e) or "403" in str(e):
                 st.error("❌ Invalid API key. Get your key at aistudio.google.com")
@@ -374,7 +592,8 @@ with st.sidebar:
 st.title("🏈 NFL Combine Career Predictor")
 st.markdown(
     "Search any NFL combine participant **or enter stats manually** for current combine players. "
-    "Claude AI compares their metrics against thousands of historical players and predicts career trajectory."
+    "Gemini AI compares their metrics against thousands of historical players and predicts career trajectory — "
+    "using actual NFL stats when the player has already entered the league."
 )
 
 # ── Mode selector ─────────────────────────────────────────────────────────────
