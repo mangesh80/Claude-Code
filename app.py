@@ -174,11 +174,19 @@ def get_player_career_stats(player_name: str) -> tuple[pd.DataFrame | None, str 
     if seasonal is None:
         return None, load_err or "Could not load NFL stats data."
 
+    # Try known column names, then fall back to any column whose name contains "name"
     name_col = next(
-        (c for c in ("player_display_name", "player_name") if c in seasonal.columns), None
+        (c for c in ("player_display_name", "player_name", "display_name", "name")
+         if c in seasonal.columns),
+        None,
     )
     if name_col is None:
-        return None, "No player-name column found in NFL stats data."
+        name_cols_found = [c for c in seasonal.columns if "name" in c.lower()]
+        if name_cols_found:
+            name_col = name_cols_found[0]
+        else:
+            cols_preview = ", ".join(seasonal.columns[:15].tolist())
+            return None, f"No player-name column found. Available columns: {cols_preview}"
 
     name_lower = player_name.lower().strip()
 
