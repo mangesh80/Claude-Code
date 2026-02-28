@@ -131,31 +131,48 @@ _STAT_RENAME = {
 
 
 @st.cache_data(show_spinner=False)
-def load_nfl_seasonal_data() -> pd.DataFrame | None:
-    """Load all available NFL regular-season stats (cached after first call)."""
-    try:
-        import nfl_data_py as nfl
-        years = list(range(1999, CURRENT_YEAR + 1))
-        return nfl.import_seasonal_data(years, s_type="REG")
-    except Exception:
-        return None
+def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
+    """Load NFL regular-season player stats.
+
+    Returns (DataFrame, None) on success, or (None, error_message) on failure.
+    Falls back to recent 6 years if the full-history load fails.
+    """
+    import nfl_data_py as nfl
+
+    # Try full history first
+    for year_range in [
+        list(range(1999, CURRENT_YEAR + 1)),   # full history
+        list(range(CURRENT_YEAR - 5, CURRENT_YEAR + 1)),  # recent 6 years
+    ]:
+        try:
+            df = nfl.import_seasonal_data(year_range)
+            if df is not None and not df.empty:
+                return df, None
+        except Exception:
+            pass
+
+    return None, "import_seasonal_data failed — check nfl_data_py version or network."
 
 
-def get_player_career_stats(player_name: str) -> pd.DataFrame | None:
-    """Return career NFL stats for a player, or None if they have no NFL record."""
-    seasonal = load_nfl_seasonal_data()
-    if seasonal is None or seasonal.empty:
-        return None
+def get_player_career_stats(player_name: str) -> tuple[pd.DataFrame | None, str | None]:
+    """Return (career_stats_or_None, diagnostic_message).
+
+    diagnostic is non-None whenever something went wrong or the player simply
+    has no NFL record — the caller decides how to surface it.
+    """
+    seasonal, load_err = load_nfl_seasonal_data()
+    if seasonal is None:
+        return None, load_err or "Could not load NFL stats data."
 
     name_col = next(
         (c for c in ("player_display_name", "player_name") if c in seasonal.columns), None
     )
     if name_col is None:
-        return None
+        return None, "No player-name column found in NFL stats data."
 
     name_lower = player_name.lower().strip()
 
-    # 1. Exact match
+    # 1. Exact (case-insensitive) match
     mask = seasonal[name_col].str.lower().str.strip() == name_lower
     found = seasonal[mask]
 
@@ -171,13 +188,16 @@ def get_player_career_stats(player_name: str) -> pd.DataFrame | None:
             found = seasonal[mask2]
 
     if found.empty:
-        return None
+        return None, f'"{player_name}" not found in NFL stats — no NFL record or name mismatch.'
 
-    # Only keep seasons where the player actually played
+    # Only keep seasons where the player actually appeared in a game
     if "games" in found.columns:
         found = found[found["games"].fillna(0) > 0]
 
-    return found.sort_values("season").reset_index(drop=True) if not found.empty else None
+    if found.empty:
+        return None, f'"{player_name}" found in data but has zero games played.'
+
+    return found.sort_values("season").reset_index(drop=True), None
 
 
 def format_career_stats_for_prompt(nfl_stats: pd.DataFrame, pos: str) -> str:
@@ -399,9 +419,10 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
 
     # ── Fetch NFL career stats (search mode only) ──────────────────────────────
     nfl_stats = None
+    nfl_diag  = None
     if not is_manual:
         with st.spinner("Checking for NFL career stats…"):
-            nfl_stats = get_player_career_stats(str(target.get("player_name", "")))
+            nfl_stats, nfl_diag = get_player_career_stats(str(target.get("player_name", "")))
 
     # ── Player header ──────────────────────────────────────────────────────────
     dr, dp = target.get("draft_round"), target.get("draft_ovr")
@@ -446,7 +467,10 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
                 val_str = str(round(float(v), 2)) if pd.notna(v) and v != 0 else "N/A"
             col.metric(label=label, value=val_str)
 
-    # ── NFL Career Stats display (if available) ────────────────────────────────
+    # ── NFL Career Stats display (or diagnostic if unavailable) ───────────────
+    if nfl_diag and nfl_stats is None:
+        st.caption(f"ℹ️ NFL stats: {nfl_diag}")
+
     if nfl_stats is not None:
         st.divider()
         st.markdown('<div class="section-title">📊 NFL Career Stats</div>', unsafe_allow_html=True)
