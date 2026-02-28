@@ -526,10 +526,12 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
     year    = int(target["season"]) if pd.notna(target.get("season")) else "?"
     school  = target.get("school", "")
 
-    # ── Fetch NFL career stats (search mode only) ──────────────────────────────
+    # ── Fetch NFL career stats (search mode only, offensive positions only) ───
+    # import_seasonal_data() covers only offensive skill positions. Defensive
+    # players (LB, DE, CB, S, etc.) and OL are not in the dataset — skip silently.
     nfl_stats = None
     nfl_diag  = None
-    if not is_manual:
+    if not is_manual and str(target.get("pos", "")).upper() in _CAREER_STAT_COLS:
         with st.spinner("Checking for NFL career stats…"):
             nfl_stats, nfl_diag = get_player_career_stats(str(target.get("player_name", "")))
 
