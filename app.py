@@ -598,7 +598,10 @@ with st.sidebar:
     st.markdown("## ⚙️ Settings")
 
     # Read key from Streamlit secrets (Cloud) or env var (local)
-    _default_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+    try:
+        _default_key = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+    except Exception:
+        _default_key = os.getenv("GOOGLE_API_KEY", "")
     api_key_input = st.text_input(
         "Google API Key",
         type="password",
