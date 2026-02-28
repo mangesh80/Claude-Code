@@ -146,25 +146,32 @@ def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
     import nfl_data_py as nfl
 
     # ── 1. Load seasonal stats ────────────────────────────────────────────────
+    # Strategy: load a stable base range (ending at NFL_CURRENT_SEASON-1), then
+    # try to append the current season individually.  This handles the case where
+    # the current-season parquet isn't published yet (404) without losing the
+    # prior season's data.
     last_err = ""
     df = None
-    for max_year in [NFL_CURRENT_SEASON, NFL_CURRENT_SEASON - 1, NFL_CURRENT_SEASON - 2]:
-        for year_range in [
-            list(range(max(max_year - 4, 1999), max_year + 1)),
-            list(range(1999, max_year + 1)),
-        ]:
-            try:
-                df = nfl.import_seasonal_data(year_range)
-                if df is not None and not df.empty:
-                    break
-            except Exception as e:
-                last_err = str(e)
+
+    # Find the highest base year that loads cleanly (usually NFL_CURRENT_SEASON-1)
+    for base_max in [NFL_CURRENT_SEASON - 1, NFL_CURRENT_SEASON - 2]:
+        try:
+            df = nfl.import_seasonal_data(list(range(1999, base_max + 1)))
+            if df is not None and not df.empty:
                 break
-        if df is not None and not df.empty:
-            break
+        except Exception as e:
+            last_err = str(e)
 
     if df is None or df.empty:
         return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
+
+    # Try to append the current season on top (may 404 if not yet published)
+    try:
+        df_cur = nfl.import_seasonal_data([NFL_CURRENT_SEASON])
+        if df_cur is not None and not df_cur.empty:
+            df = pd.concat([df, df_cur], ignore_index=True)
+    except Exception:
+        pass  # current season not available yet — continue with base data
 
     # ── 2. Enrich with player names if not already present ───────────────────
     has_name = any(c in df.columns for c in
