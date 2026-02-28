@@ -30,6 +30,11 @@ from nfl_combine_analyzer import (
 
 CURRENT_YEAR = datetime.date.today().year
 
+# Most recent completed NFL season (seasons are labeled by the year they start;
+# the Super Bowl is in February, so before August the latest season = last year).
+_today = datetime.date.today()
+NFL_CURRENT_SEASON = _today.year - 1 if _today.month < 8 else _today.year
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="NFL Combine Career Predictor",
@@ -135,23 +140,24 @@ def load_nfl_seasonal_data() -> tuple[pd.DataFrame | None, str | None]:
     """Load NFL regular-season player stats.
 
     Returns (DataFrame, None) on success, or (None, error_message) on failure.
-    Falls back to recent 6 years if the full-history load fails.
+    Tries recent seasons first (faster), then full history.
+    Never requests years beyond NFL_CURRENT_SEASON to avoid missing-file errors.
     """
     import nfl_data_py as nfl
 
-    # Try full history first
+    last_err = ""
     for year_range in [
-        list(range(1999, CURRENT_YEAR + 1)),   # full history
-        list(range(CURRENT_YEAR - 5, CURRENT_YEAR + 1)),  # recent 6 years
+        list(range(NFL_CURRENT_SEASON - 4, NFL_CURRENT_SEASON + 1)),  # recent 5 seasons (fast)
+        list(range(1999, NFL_CURRENT_SEASON + 1)),                     # full history
     ]:
         try:
             df = nfl.import_seasonal_data(year_range)
             if df is not None and not df.empty:
                 return df, None
-        except Exception:
-            pass
+        except Exception as e:
+            last_err = str(e)
 
-    return None, "import_seasonal_data failed — check nfl_data_py version or network."
+    return None, f"NFL stats unavailable: {last_err or 'unknown error'}"
 
 
 def get_player_career_stats(player_name: str) -> tuple[pd.DataFrame | None, str | None]:
