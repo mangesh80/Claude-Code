@@ -370,12 +370,15 @@ def stream_analysis(
     metrics: list,
     api_key: str,
     nfl_stats: pd.DataFrame | None = None,
+    nfl_drafted: bool = False,
 ):
     """Generator that yields text chunks from Gemini.
 
-    If *nfl_stats* is provided the prompt pivots to a future-projection
-    analysis grounded in the player's actual NFL career data rather than
-    a pure combine-based prediction.
+    Three prompt branches:
+    - nfl_stats provided  → project future based on actual career stats
+    - nfl_drafted=True    → player had NFL career but stats aren't in our DB
+                            (defensive/OL); ask Gemini to use its own knowledge
+    - neither             → pure combine-based prospect prediction
     """
     client = genai.Client(api_key=api_key)
     pos = target.get("pos", "?")
@@ -474,6 +477,42 @@ Has their combine athletic profile translated to the field? Do their physical tr
 
 Be specific. Cite their actual stat lines. Ground every projection in evidence from their NFL career, not combine potential."""
 
+    elif nfl_drafted:
+        # Player was drafted and had an NFL career, but their stats aren't in our
+        # database (defensive / OL positions).  Ask Gemini to draw on its own
+        # training knowledge of the player's actual career.
+        combine_year = int(target["season"]) if pd.notna(target.get("season")) else "?"
+        prompt = f"""You are a veteran NFL historian and analyst with encyclopedic knowledge of every NFL player's career from 2000 to the present.
+
+The player below attended the NFL Combine and was drafted into the NFL. Our statistics database only covers offensive skill positions, so we do not have their career stats on hand. Use YOUR OWN KNOWLEDGE of this player's actual NFL career to provide the analysis.
+
+═══ PLAYER PROFILE ═══
+{target_text}
+
+═══ MOST SIMILAR COMBINE PROFILES AT {pos} (athletic baseline reference) ═══
+{comps_text}
+
+═══ ANALYSIS REQUIRED ═══
+
+**1. NFL CAREER SUMMARY**
+Based on your knowledge, describe this player's actual NFL career: teams, seasons played, key achievements, awards (Pro Bowls, All-Pro selections, championships), and whether they are active or retired. If retired, note when and why.
+
+**2. CAREER GRADE**
+Grade their overall NFL career (Bust / Depth Player / Solid Starter / Pro Bowl Caliber / Elite / Hall of Fame) and explain why.
+
+**3. COMBINE PROFILE vs. NFL REALITY**
+Did their combine athletic profile predict their actual career outcome? Which measurables were most predictive? Were there any red flags or hidden gems in their numbers?
+
+**4. HISTORICAL COMP ANALYSIS**
+For the listed comparable players, briefly describe their actual NFL careers. How does this player compare to those comps in terms of career outcome?
+
+**5. LEGACY & FINAL VERDICT**
+- Career status: Active / Retired / Career cut short
+- Career tier: Bust / Depth Player / Starter / Pro Bowl / Elite / Hall of Fame
+- One concise paragraph on their career legacy and how their athleticism translated to NFL success
+
+Be specific. Cite real career facts, statistics, and achievements from your training knowledge."""
+
     else:
         # Pure prospect — combine-based prediction
         prompt = f"""You are a veteran NFL scout and draft analyst with encyclopedic knowledge of NFL combine history, draft results, and player career trajectories from 2000 to the present.
@@ -535,6 +574,10 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
         with st.spinner("Checking for NFL career stats…"):
             nfl_stats, nfl_diag = get_player_career_stats(str(target.get("player_name", "")))
 
+    # Was this player drafted into the NFL? (used for badge + prompt branch)
+    dr_round = target.get("draft_round")
+    nfl_drafted = not is_manual and pd.notna(dr_round)
+
     # ── Player header ──────────────────────────────────────────────────────────
     dr, dp = target.get("draft_round"), target.get("draft_ovr")
     pos_badge  = f'<span class="badge badge-pos">{pos}</span>'
@@ -549,6 +592,16 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
             '<span class="badge badge-r1">Active NFL Player</span>'
             if is_active
             else '<span class="badge badge-late">Former NFL Player</span>'
+        )
+    elif nfl_drafted:
+        # No stats in our DB (defensive/OL), but player was drafted — infer status
+        # from combine year: if they combined 6+ years ago they're likely retired
+        combine_yr = int(target["season"]) if pd.notna(target.get("season")) else CURRENT_YEAR
+        likely_retired = (CURRENT_YEAR - combine_yr) >= 6
+        nfl_tag = (
+            '<span class="badge badge-late">Former NFL Player</span>'
+            if likely_retired
+            else '<span class="badge badge-r1">NFL Player</span>'
         )
 
     st.markdown(f"""
@@ -684,7 +737,7 @@ def show_results(target: pd.Series, df: pd.DataFrame, num_comps: int, effective_
     else:
         try:
             with st.spinner("Gemini is thinking..."):
-                st.write_stream(stream_analysis(target, similar, metrics, effective_key, nfl_stats=nfl_stats))
+                st.write_stream(stream_analysis(target, similar, metrics, effective_key, nfl_stats=nfl_stats, nfl_drafted=nfl_drafted))
         except Exception as e:
             if "API_KEY" in str(e).upper() or "401" in str(e) or "403" in str(e):
                 st.error("❌ Invalid API key. Get your key at aistudio.google.com")
